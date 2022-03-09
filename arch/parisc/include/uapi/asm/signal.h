@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 #ifndef _UAPI_ASM_PARISC_SIGNAL_H
 #define _UAPI_ASM_PARISC_SIGNAL_H
 
@@ -8,12 +9,12 @@
 #define SIGTRAP		 5
 #define SIGABRT		 6
 #define SIGIOT		 6
-#define SIGEMT		 7
+#define SIGSTKFLT	 7
 #define SIGFPE		 8
 #define SIGKILL		 9
 #define SIGBUS		10
 #define SIGSEGV		11
-#define SIGSYS		12 /* Linux doesn't use this */
+#define SIGXCPU		12
 #define SIGPIPE		13
 #define SIGALRM		14
 #define SIGTERM		15
@@ -32,17 +33,13 @@
 #define SIGTTIN		27
 #define SIGTTOU		28
 #define SIGURG		29
-#define SIGLOST		30 /* Linux doesn't use this either */
-#define	SIGUNUSED	31
-#define SIGRESERVE	SIGUNUSED
-
-#define SIGXCPU		33
-#define SIGXFSZ		34
-#define SIGSTKFLT	36
+#define SIGXFSZ		30
+#define SIGUNUSED	31
+#define SIGSYS		31
 
 /* These should not be considered constants from userland.  */
-#define SIGRTMIN	37
-#define SIGRTMAX	_NSIG /* it's 44 under HP/UX */
+#define SIGRTMIN	32
+#define SIGRTMAX	_NSIG
 
 /*
  * SA_FLAGS values:
@@ -64,7 +61,6 @@
 #define SA_NODEFER	0x00000020
 #define SA_RESTART	0x00000040
 #define SA_NOCLDWAIT	0x00000080
-#define _SA_SIGGFAULT	0x00000100 /* HPUX */
 
 #define SA_NOMASK	SA_NODEFER
 #define SA_ONESHOT	SA_RESETHAND
@@ -89,7 +85,7 @@
 struct siginfo;
 
 /* Type of a signal handler.  */
-#ifdef CONFIG_64BIT
+#if defined(__LP64__)
 /* function pointers on 64-bit parisc are pointers to little structs and the
  * compiler doesn't support code which changes or tests the address of
  * the function in the little struct.  This is really ugly -PB

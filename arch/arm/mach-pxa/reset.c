@@ -1,8 +1,4 @@
-/*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
+// SPDX-License-Identifier: GPL-2.0-only
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/delay.h>
@@ -90,7 +86,7 @@ static void do_hw_reset(void)
 		writel_relaxed(MDREFR_SLFRSH, MDREFR);
 }
 
-void pxa_restart(char mode, const char *cmd)
+void pxa_restart(enum reboot_mode mode, const char *cmd)
 {
 	local_irq_disable();
 	local_fiq_disable();
@@ -98,14 +94,14 @@ void pxa_restart(char mode, const char *cmd)
 	clear_reset_status(RESET_STATUS_ALL);
 
 	switch (mode) {
-	case 's':
+	case REBOOT_SOFT:
 		/* Jump into ROM at address 0 */
 		soft_restart(0);
 		break;
-	case 'g':
+	case REBOOT_GPIO:
 		do_gpio_reset();
 		break;
-	case 'h':
+	case REBOOT_HARD:
 	default:
 		do_hw_reset();
 		break;

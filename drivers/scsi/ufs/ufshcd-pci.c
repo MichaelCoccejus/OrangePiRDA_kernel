@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Universal Flash Storage Host controller PCI glue driver
  *
@@ -7,71 +8,284 @@
  * Authors:
  *	Santosh Yaraganavi <santosh.sy@samsung.com>
  *	Vinayak Holikatti <h.vinayak@samsung.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- * See the COPYING file in the top-level directory or visit
- * <http://www.gnu.org/licenses/gpl-2.0.html>
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * This program is provided "AS IS" and "WITH ALL FAULTS" and
- * without warranty of any kind. You are solely responsible for
- * determining the appropriateness of using and distributing
- * the program and assume all risks associated with your exercise
- * of rights with respect to the program, including but not limited
- * to infringement of third party rights, the risks and costs of
- * program errors, damage to or loss of data, programs or equipment,
- * and unavailability or interruption of operations. Under no
- * circumstances will the contributor of this Program be liable for
- * any damages of any kind arising from your use or distribution of
- * this program.
  */
 
 #include "ufshcd.h"
 #include <linux/pci.h>
+#include <linux/pm_runtime.h>
+#include <linux/pm_qos.h>
+#include <linux/debugfs.h>
 
-#ifdef CONFIG_PM
-/**
- * ufshcd_pci_suspend - suspend power management function
- * @pdev: pointer to PCI device handle
- * @state: power state
- *
- * Returns -ENOSYS
- */
-static int ufshcd_pci_suspend(struct pci_dev *pdev, pm_message_t state)
+struct intel_host {
+	u32		active_ltr;
+	u32		idle_ltr;
+	struct dentry	*debugfs_root;
+};
+
+static int ufs_intel_disable_lcc(struct ufs_hba *hba)
+{
+	u32 attr = UIC_ARG_MIB(PA_LOCAL_TX_LCC_ENABLE);
+	u32 lcc_enable = 0;
+
+	ufshcd_dme_get(hba, attr, &lcc_enable);
+	if (lcc_enable)
+		ufshcd_disable_host_tx_lcc(hba);
+
+	return 0;
+}
+
+static int ufs_intel_link_startup_notify(struct ufs_hba *hba,
+					 enum ufs_notify_change_status status)
+{
+	int err = 0;
+
+	switch (status) {
+	case PRE_CHANGE:
+		err = ufs_intel_disable_lcc(hba);
+		break;
+	case POST_CHANGE:
+		break;
+	default:
+		break;
+	}
+
+	return err;
+}
+
+#define INTEL_ACTIVELTR		0x804
+#define INTEL_IDLELTR		0x808
+
+#define INTEL_LTR_REQ		BIT(15)
+#define INTEL_LTR_SCALE_MASK	GENMASK(11, 10)
+#define INTEL_LTR_SCALE_1US	(2 << 10)
+#define INTEL_LTR_SCALE_32US	(3 << 10)
+#define INTEL_LTR_VALUE_MASK	GENMASK(9, 0)
+
+static void intel_cache_ltr(struct ufs_hba *hba)
+{
+	struct intel_host *host = ufshcd_get_variant(hba);
+
+	host->active_ltr = readl(hba->mmio_base + INTEL_ACTIVELTR);
+	host->idle_ltr = readl(hba->mmio_base + INTEL_IDLELTR);
+}
+
+static void intel_ltr_set(struct device *dev, s32 val)
+{
+	struct ufs_hba *hba = dev_get_drvdata(dev);
+	struct intel_host *host = ufshcd_get_variant(hba);
+	u32 ltr;
+
+	pm_runtime_get_sync(dev);
+
+	/*
+	 * Program latency tolerance (LTR) accordingly what has been asked
+	 * by the PM QoS layer or disable it in case we were passed
+	 * negative value or PM_QOS_LATENCY_ANY.
+	 */
+	ltr = readl(hba->mmio_base + INTEL_ACTIVELTR);
+
+	if (val == PM_QOS_LATENCY_ANY || val < 0) {
+		ltr &= ~INTEL_LTR_REQ;
+	} else {
+		ltr |= INTEL_LTR_REQ;
+		ltr &= ~INTEL_LTR_SCALE_MASK;
+		ltr &= ~INTEL_LTR_VALUE_MASK;
+
+		if (val > INTEL_LTR_VALUE_MASK) {
+			val >>= 5;
+			if (val > INTEL_LTR_VALUE_MASK)
+				val = INTEL_LTR_VALUE_MASK;
+			ltr |= INTEL_LTR_SCALE_32US | val;
+		} else {
+			ltr |= INTEL_LTR_SCALE_1US | val;
+		}
+	}
+
+	if (ltr == host->active_ltr)
+		goto out;
+
+	writel(ltr, hba->mmio_base + INTEL_ACTIVELTR);
+	writel(ltr, hba->mmio_base + INTEL_IDLELTR);
+
+	/* Cache the values into intel_host structure */
+	intel_cache_ltr(hba);
+out:
+	pm_runtime_put(dev);
+}
+
+static void intel_ltr_expose(struct device *dev)
+{
+	dev->power.set_latency_tolerance = intel_ltr_set;
+	dev_pm_qos_expose_latency_tolerance(dev);
+}
+
+static void intel_ltr_hide(struct device *dev)
+{
+	dev_pm_qos_hide_latency_tolerance(dev);
+	dev->power.set_latency_tolerance = NULL;
+}
+
+static void intel_add_debugfs(struct ufs_hba *hba)
+{
+	struct dentry *dir = debugfs_create_dir(dev_name(hba->dev), NULL);
+	struct intel_host *host = ufshcd_get_variant(hba);
+
+	intel_cache_ltr(hba);
+
+	host->debugfs_root = dir;
+	debugfs_create_x32("active_ltr", 0444, dir, &host->active_ltr);
+	debugfs_create_x32("idle_ltr", 0444, dir, &host->idle_ltr);
+}
+
+static void intel_remove_debugfs(struct ufs_hba *hba)
+{
+	struct intel_host *host = ufshcd_get_variant(hba);
+
+	debugfs_remove_recursive(host->debugfs_root);
+}
+
+static int ufs_intel_common_init(struct ufs_hba *hba)
+{
+	struct intel_host *host;
+
+	hba->caps |= UFSHCD_CAP_RPM_AUTOSUSPEND;
+
+	host = devm_kzalloc(hba->dev, sizeof(*host), GFP_KERNEL);
+	if (!host)
+		return -ENOMEM;
+	ufshcd_set_variant(hba, host);
+	intel_ltr_expose(hba->dev);
+	intel_add_debugfs(hba);
+	return 0;
+}
+
+static void ufs_intel_common_exit(struct ufs_hba *hba)
+{
+	intel_remove_debugfs(hba);
+	intel_ltr_hide(hba->dev);
+}
+
+static int ufs_intel_resume(struct ufs_hba *hba, enum ufs_pm_op op)
 {
 	/*
-	 * TODO:
-	 * 1. Call ufshcd_suspend
-	 * 2. Do bus specific power management
+	 * To support S4 (suspend-to-disk) with spm_lvl other than 5, the base
+	 * address registers must be restored because the restore kernel can
+	 * have used different addresses.
 	 */
+	ufshcd_writel(hba, lower_32_bits(hba->utrdl_dma_addr),
+		      REG_UTP_TRANSFER_REQ_LIST_BASE_L);
+	ufshcd_writel(hba, upper_32_bits(hba->utrdl_dma_addr),
+		      REG_UTP_TRANSFER_REQ_LIST_BASE_H);
+	ufshcd_writel(hba, lower_32_bits(hba->utmrdl_dma_addr),
+		      REG_UTP_TASK_REQ_LIST_BASE_L);
+	ufshcd_writel(hba, upper_32_bits(hba->utmrdl_dma_addr),
+		      REG_UTP_TASK_REQ_LIST_BASE_H);
 
-	return -ENOSYS;
+	if (ufshcd_is_link_hibern8(hba)) {
+		int ret = ufshcd_uic_hibern8_exit(hba);
+
+		if (!ret) {
+			ufshcd_set_link_active(hba);
+		} else {
+			dev_err(hba->dev, "%s: hibern8 exit failed %d\n",
+				__func__, ret);
+			/*
+			 * Force reset and restore. Any other actions can lead
+			 * to an unrecoverable state.
+			 */
+			ufshcd_set_link_off(hba);
+		}
+	}
+
+	return 0;
+}
+
+static int ufs_intel_ehl_init(struct ufs_hba *hba)
+{
+	hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
+	return ufs_intel_common_init(hba);
+}
+
+static struct ufs_hba_variant_ops ufs_intel_cnl_hba_vops = {
+	.name                   = "intel-pci",
+	.init			= ufs_intel_common_init,
+	.exit			= ufs_intel_common_exit,
+	.link_startup_notify	= ufs_intel_link_startup_notify,
+	.resume			= ufs_intel_resume,
+};
+
+static struct ufs_hba_variant_ops ufs_intel_ehl_hba_vops = {
+	.name                   = "intel-pci",
+	.init			= ufs_intel_ehl_init,
+	.exit			= ufs_intel_common_exit,
+	.link_startup_notify	= ufs_intel_link_startup_notify,
+	.resume			= ufs_intel_resume,
+};
+
+#ifdef CONFIG_PM_SLEEP
+/**
+ * ufshcd_pci_suspend - suspend power management function
+ * @dev: pointer to PCI device handle
+ *
+ * Returns 0 if successful
+ * Returns non-zero otherwise
+ */
+static int ufshcd_pci_suspend(struct device *dev)
+{
+	return ufshcd_system_suspend(dev_get_drvdata(dev));
 }
 
 /**
  * ufshcd_pci_resume - resume power management function
- * @pdev: pointer to PCI device handle
+ * @dev: pointer to PCI device handle
  *
- * Returns -ENOSYS
+ * Returns 0 if successful
+ * Returns non-zero otherwise
  */
-static int ufshcd_pci_resume(struct pci_dev *pdev)
+static int ufshcd_pci_resume(struct device *dev)
 {
-	/*
-	 * TODO:
-	 * 1. Call ufshcd_resume.
-	 * 2. Do bus specific wake up
-	 */
-
-	return -ENOSYS;
+	return ufshcd_system_resume(dev_get_drvdata(dev));
 }
-#endif /* CONFIG_PM */
+
+/**
+ * ufshcd_pci_poweroff - suspend-to-disk poweroff function
+ * @dev: pointer to PCI device handle
+ *
+ * Returns 0 if successful
+ * Returns non-zero otherwise
+ */
+static int ufshcd_pci_poweroff(struct device *dev)
+{
+	struct ufs_hba *hba = dev_get_drvdata(dev);
+	int spm_lvl = hba->spm_lvl;
+	int ret;
+
+	/*
+	 * For poweroff we need to set the UFS device to PowerDown mode.
+	 * Force spm_lvl to ensure that.
+	 */
+	hba->spm_lvl = 5;
+	ret = ufshcd_system_suspend(hba);
+	hba->spm_lvl = spm_lvl;
+	return ret;
+}
+
+#endif /* !CONFIG_PM_SLEEP */
+
+#ifdef CONFIG_PM
+static int ufshcd_pci_runtime_suspend(struct device *dev)
+{
+	return ufshcd_runtime_suspend(dev_get_drvdata(dev));
+}
+static int ufshcd_pci_runtime_resume(struct device *dev)
+{
+	return ufshcd_runtime_resume(dev_get_drvdata(dev));
+}
+static int ufshcd_pci_runtime_idle(struct device *dev)
+{
+	return ufshcd_runtime_idle(dev_get_drvdata(dev));
+}
+#endif /* !CONFIG_PM */
 
 /**
  * ufshcd_pci_shutdown - main function to put the controller in reset state
@@ -79,45 +293,22 @@ static int ufshcd_pci_resume(struct pci_dev *pdev)
  */
 static void ufshcd_pci_shutdown(struct pci_dev *pdev)
 {
-	ufshcd_hba_stop((struct ufs_hba *)pci_get_drvdata(pdev));
+	ufshcd_shutdown((struct ufs_hba *)pci_get_drvdata(pdev));
 }
 
 /**
  * ufshcd_pci_remove - de-allocate PCI/SCSI host and host memory space
  *		data structure memory
- * @pdev - pointer to PCI handle
+ * @pdev: pointer to PCI handle
  */
 static void ufshcd_pci_remove(struct pci_dev *pdev)
 {
 	struct ufs_hba *hba = pci_get_drvdata(pdev);
 
-	disable_irq(pdev->irq);
-	free_irq(pdev->irq, hba);
+	pm_runtime_forbid(&pdev->dev);
+	pm_runtime_get_noresume(&pdev->dev);
 	ufshcd_remove(hba);
-	pci_release_regions(pdev);
-	pci_set_drvdata(pdev, NULL);
-	pci_clear_master(pdev);
-	pci_disable_device(pdev);
-}
-
-/**
- * ufshcd_set_dma_mask - Set dma mask based on the controller
- *			 addressing capability
- * @pdev: PCI device structure
- *
- * Returns 0 for success, non-zero for failure
- */
-static int ufshcd_set_dma_mask(struct pci_dev *pdev)
-{
-	int err;
-
-	if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(64))
-		&& !pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64)))
-		return 0;
-	err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
-	if (!err)
-		err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32));
-	return err;
+	ufshcd_dealloc_host(hba);
 }
 
 /**
@@ -134,57 +325,62 @@ ufshcd_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	void __iomem *mmio_base;
 	int err;
 
-	err = pci_enable_device(pdev);
+	err = pcim_enable_device(pdev);
 	if (err) {
-		dev_err(&pdev->dev, "pci_enable_device failed\n");
-		goto out_error;
+		dev_err(&pdev->dev, "pcim_enable_device failed\n");
+		return err;
 	}
 
 	pci_set_master(pdev);
 
-
-	err = pci_request_regions(pdev, UFSHCD);
+	err = pcim_iomap_regions(pdev, 1 << 0, UFSHCD);
 	if (err < 0) {
-		dev_err(&pdev->dev, "request regions failed\n");
-		goto out_disable;
+		dev_err(&pdev->dev, "request and iomap failed\n");
+		return err;
 	}
 
-	mmio_base = pci_ioremap_bar(pdev, 0);
-	if (!mmio_base) {
-		dev_err(&pdev->dev, "memory map failed\n");
-		err = -ENOMEM;
-		goto out_release_regions;
-	}
+	mmio_base = pcim_iomap_table(pdev)[0];
 
-	err = ufshcd_set_dma_mask(pdev);
+	err = ufshcd_alloc_host(&pdev->dev, &hba);
 	if (err) {
-		dev_err(&pdev->dev, "set dma mask failed\n");
-		goto out_iounmap;
+		dev_err(&pdev->dev, "Allocation failed\n");
+		return err;
 	}
 
-	err = ufshcd_init(&pdev->dev, &hba, mmio_base, pdev->irq);
+	hba->vops = (struct ufs_hba_variant_ops *)id->driver_data;
+
+	err = ufshcd_init(hba, mmio_base, pdev->irq);
 	if (err) {
 		dev_err(&pdev->dev, "Initialization failed\n");
-		goto out_iounmap;
+		ufshcd_dealloc_host(hba);
+		return err;
 	}
 
-	pci_set_drvdata(pdev, hba);
+	pm_runtime_put_noidle(&pdev->dev);
+	pm_runtime_allow(&pdev->dev);
 
 	return 0;
-
-out_iounmap:
-	iounmap(mmio_base);
-out_release_regions:
-	pci_release_regions(pdev);
-out_disable:
-	pci_clear_master(pdev);
-	pci_disable_device(pdev);
-out_error:
-	return err;
 }
 
-static DEFINE_PCI_DEVICE_TABLE(ufshcd_pci_tbl) = {
+static const struct dev_pm_ops ufshcd_pci_pm_ops = {
+#ifdef CONFIG_PM_SLEEP
+	.suspend	= ufshcd_pci_suspend,
+	.resume		= ufshcd_pci_resume,
+	.freeze		= ufshcd_pci_suspend,
+	.thaw		= ufshcd_pci_resume,
+	.poweroff	= ufshcd_pci_poweroff,
+	.restore	= ufshcd_pci_resume,
+#endif
+	SET_RUNTIME_PM_OPS(ufshcd_pci_runtime_suspend,
+			   ufshcd_pci_runtime_resume,
+			   ufshcd_pci_runtime_idle)
+};
+
+static const struct pci_device_id ufshcd_pci_tbl[] = {
 	{ PCI_VENDOR_ID_SAMSUNG, 0xC00C, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
+	{ PCI_VDEVICE(INTEL, 0x9DFA), (kernel_ulong_t)&ufs_intel_cnl_hba_vops },
+	{ PCI_VDEVICE(INTEL, 0x4B41), (kernel_ulong_t)&ufs_intel_ehl_hba_vops },
+	{ PCI_VDEVICE(INTEL, 0x4B43), (kernel_ulong_t)&ufs_intel_ehl_hba_vops },
 	{ }	/* terminate list */
 };
 
@@ -196,10 +392,9 @@ static struct pci_driver ufshcd_pci_driver = {
 	.probe = ufshcd_pci_probe,
 	.remove = ufshcd_pci_remove,
 	.shutdown = ufshcd_pci_shutdown,
-#ifdef CONFIG_PM
-	.suspend = ufshcd_pci_suspend,
-	.resume = ufshcd_pci_resume,
-#endif
+	.driver = {
+		.pm = &ufshcd_pci_pm_ops
+	},
 };
 
 module_pci_driver(ufshcd_pci_driver);

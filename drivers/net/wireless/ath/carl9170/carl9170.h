@@ -68,7 +68,10 @@
 
 #define PAYLOAD_MAX	(CARL9170_MAX_CMD_LEN / 4 - 1)
 
-static const u8 ar9170_qmap[__AR9170_NUM_TXQ] = { 3, 2, 1, 0 };
+static inline u8 ar9170_qmap(u8 idx)
+{
+	return 3 - idx; /* { 3, 2, 1, 0 } */
+}
 
 #define CARL9170_MAX_RX_BUFFER_SIZE		8192
 
@@ -133,6 +136,9 @@ struct carl9170_sta_tid {
 
 	/* Preaggregation reorder queue */
 	struct sk_buff_head queue;
+
+	struct ieee80211_sta *sta;
+	struct ieee80211_vif *vif;
 };
 
 #define CARL9170_QUEUE_TIMEOUT		256

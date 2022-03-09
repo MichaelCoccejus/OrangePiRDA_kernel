@@ -1,5 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
- *    pata_ns87415.c - NS87415 (non PARISC) PATA
+ *    pata_ns87415.c - NS87415 (and PARISC SUPERIO 87560) PATA
  *
  *	(C) 2005 Red Hat <alan@lxorguk.ukuu.org.uk>
  *
@@ -15,7 +16,6 @@
  *    systems. This has its own special mountain of errata.
  *
  *    TODO:
- *	Test PARISC SuperIO
  *	Get someone to test on SPARC
  *	Implement lazy pio/dma switching for better performance
  *	8bit shared timing.
@@ -25,7 +25,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -386,10 +385,10 @@ static const struct pci_device_id ns87415_pci_tbl[] = {
 	{ }	/* terminate list */
 };
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 static int ns87415_reinit_one(struct pci_dev *pdev)
 {
-	struct ata_host *host = dev_get_drvdata(&pdev->dev);
+	struct ata_host *host = pci_get_drvdata(pdev);
 	int rc;
 
 	rc = ata_pci_device_do_resume(pdev);
@@ -408,7 +407,7 @@ static struct pci_driver ns87415_pci_driver = {
 	.id_table		= ns87415_pci_tbl,
 	.probe			= ns87415_init_one,
 	.remove			= ata_pci_remove_one,
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 	.suspend		= ata_pci_device_suspend,
 	.resume			= ns87415_reinit_one,
 #endif

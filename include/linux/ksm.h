@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __LINUX_KSM_H
 #define __LINUX_KSM_H
 /*
@@ -12,6 +13,7 @@
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
 #include <linux/sched.h>
+#include <linux/sched/coredump.h>
 
 struct stable_node;
 struct mem_cgroup;
@@ -19,29 +21,20 @@ struct mem_cgroup;
 #ifdef CONFIG_KSM
 int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
 		unsigned long end, int advice, unsigned long *vm_flags);
+int __ksm_enter(struct mm_struct *mm);
+void __ksm_exit(struct mm_struct *mm);
 
-/*
- * A KSM page is one of those write-protected "shared pages" or "merged pages"
- * which KSM maps into multiple mms, wherever identical anonymous page content
- * is found in VM_MERGEABLE vmas.  It's a PageAnon page, pointing not to any
- * anon_vma, but to that page's node of the stable tree.
- */
-static inline int PageKsm(struct page *page)
+static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 {
-	return ((unsigned long)page->mapping & PAGE_MAPPING_FLAGS) ==
-				(PAGE_MAPPING_ANON | PAGE_MAPPING_KSM);
+	if (test_bit(MMF_VM_MERGEABLE, &oldmm->flags))
+		return __ksm_enter(mm);
+	return 0;
 }
 
-static inline struct stable_node *page_stable_node(struct page *page)
+static inline void ksm_exit(struct mm_struct *mm)
 {
-	return PageKsm(page) ? page_rmapping(page) : NULL;
-}
-
-static inline void set_page_stable_node(struct page *page,
-					struct stable_node *stable_node)
-{
-	page->mapping = (void *)stable_node +
-				(PAGE_MAPPING_ANON | PAGE_MAPPING_KSM);
+	if (test_bit(MMF_VM_MERGEABLE, &mm->flags))
+		__ksm_exit(mm);
 }
 
 /*
@@ -58,39 +51,8 @@ static inline void set_page_stable_node(struct page *page,
 struct page *ksm_might_need_to_copy(struct page *page,
 			struct vm_area_struct *vma, unsigned long address);
 
-int page_referenced_ksm(struct page *page,
-			struct mem_cgroup *memcg, unsigned long *vm_flags);
-int try_to_unmap_ksm(struct page *page, enum ttu_flags flags);
-int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page *,
-		  struct vm_area_struct *, unsigned long, void *), void *arg);
+void rmap_walk_ksm(struct page *page, struct rmap_walk_control *rwc);
 void ksm_migrate_page(struct page *newpage, struct page *oldpage);
-
-#ifdef CONFIG_KSM_LEGACY
-int __ksm_enter(struct mm_struct *mm);
-void __ksm_exit(struct mm_struct *mm);
-static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
-{
-	if (test_bit(MMF_VM_MERGEABLE, &oldmm->flags))
-		return __ksm_enter(mm);
-	return 0;
-}
-
-static inline void ksm_exit(struct mm_struct *mm)
-{
-	if (test_bit(MMF_VM_MERGEABLE, &mm->flags))
-		__ksm_exit(mm);
-}
-
-#elif defined(CONFIG_UKSM)
-static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
-{
-	return 0;
-}
-
-static inline void ksm_exit(struct mm_struct *mm)
-{
-}
-#endif /* !CONFIG_UKSM */
 
 #else  /* !CONFIG_KSM */
 
@@ -101,11 +63,6 @@ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 
 static inline void ksm_exit(struct mm_struct *mm)
 {
-}
-
-static inline int PageKsm(struct page *page)
-{
-	return 0;
 }
 
 #ifdef CONFIG_MMU
@@ -121,21 +78,9 @@ static inline struct page *ksm_might_need_to_copy(struct page *page,
 	return page;
 }
 
-static inline int page_referenced_ksm(struct page *page,
-			struct mem_cgroup *memcg, unsigned long *vm_flags)
+static inline void rmap_walk_ksm(struct page *page,
+			struct rmap_walk_control *rwc)
 {
-	return 0;
-}
-
-static inline int try_to_unmap_ksm(struct page *page, enum ttu_flags flags)
-{
-	return 0;
-}
-
-static inline int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page*,
-		struct vm_area_struct *, unsigned long, void *), void *arg)
-{
-	return 0;
 }
 
 static inline void ksm_migrate_page(struct page *newpage, struct page *oldpage)
@@ -143,7 +88,5 @@ static inline void ksm_migrate_page(struct page *newpage, struct page *oldpage)
 }
 #endif /* CONFIG_MMU */
 #endif /* !CONFIG_KSM */
-
-#include <linux/uksm.h>
 
 #endif /* __LINUX_KSM_H */

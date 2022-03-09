@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /**
  * ipoctal.c
  *
@@ -6,10 +7,6 @@
  * Copyright (C) 2009-2012 CERN (www.cern.ch)
  * Author: Nicolas Serafini, EIC2 SA
  * Author: Samuel Iglesias Gonsalvez <siglesias@igalia.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; version 2 of the License.
  */
 
 #include <linux/device.h>
@@ -38,6 +35,7 @@ struct ipoctal_channel {
 	unsigned int			pointer_read;
 	unsigned int			pointer_write;
 	struct tty_port			tty_port;
+	bool				tty_registered;
 	union scc2698_channel __iomem	*regs;
 	union scc2698_block __iomem	*block_regs;
 	unsigned int			board_id;
@@ -55,6 +53,22 @@ struct ipoctal {
 	u8 __iomem			*int_space;
 };
 
+static inline struct ipoctal *chan_to_ipoctal(struct ipoctal_channel *chan,
+					      unsigned int index)
+{
+	return container_of(chan, struct ipoctal, channel[index]);
+}
+
+static void ipoctal_reset_channel(struct ipoctal_channel *channel)
+{
+	iowrite8(CR_DISABLE_RX | CR_DISABLE_TX, &channel->regs->w.cr);
+	channel->rx_enable = 0;
+	iowrite8(CR_CMD_RESET_RX, &channel->regs->w.cr);
+	iowrite8(CR_CMD_RESET_TX, &channel->regs->w.cr);
+	iowrite8(CR_CMD_RESET_ERR_STATUS, &channel->regs->w.cr);
+	iowrite8(CR_CMD_RESET_MR, &channel->regs->w.cr);
+}
+
 static int ipoctal_port_activate(struct tty_port *port, struct tty_struct *tty)
 {
 	struct ipoctal_channel *channel;
@@ -70,12 +84,32 @@ static int ipoctal_port_activate(struct tty_port *port, struct tty_struct *tty)
 	return 0;
 }
 
+static int ipoctal_install(struct tty_driver *driver, struct tty_struct *tty)
+{
+	struct ipoctal_channel *channel = dev_get_drvdata(tty->dev);
+	struct ipoctal *ipoctal = chan_to_ipoctal(channel, tty->index);
+	int res;
+
+	if (!ipack_get_carrier(ipoctal->dev))
+		return -EBUSY;
+
+	res = tty_standard_install(driver, tty);
+	if (res)
+		goto err_put_carrier;
+
+	tty->driver_data = channel;
+
+	return 0;
+
+err_put_carrier:
+	ipack_put_carrier(ipoctal->dev);
+
+	return res;
+}
+
 static int ipoctal_open(struct tty_struct *tty, struct file *file)
 {
-	struct ipoctal_channel *channel;
-
-	channel = dev_get_drvdata(tty->dev);
-	tty->driver_data = channel;
+	struct ipoctal_channel *channel = tty->driver_data;
 
 	return tty_port_open(&channel->tty_port, tty, file);
 }
@@ -151,7 +185,6 @@ static void ipoctal_irq_rx(struct ipoctal_channel *channel, u8 sr)
 				flag = TTY_FRAME;
 			}
 			if (sr & SR_RECEIVED_BREAK) {
-				iowrite8(CR_CMD_RESET_BREAK_CHANGE, &channel->regs->w.cr);
 				channel->stats.rcv_break++;
 				flag = TTY_BREAK;
 			}
@@ -177,23 +210,27 @@ static void ipoctal_irq_tx(struct ipoctal_channel *channel)
 	if (channel->nb_bytes == 0)
 		return;
 
+	spin_lock(&channel->lock);
 	value = channel->tty_port.xmit_buf[*pointer_write];
 	iowrite8(value, &channel->regs->w.thr);
 	channel->stats.tx++;
 	(*pointer_write)++;
 	*pointer_write = *pointer_write % PAGE_SIZE;
 	channel->nb_bytes--;
+	spin_unlock(&channel->lock);
 }
 
 static void ipoctal_irq_channel(struct ipoctal_channel *channel)
 {
 	u8 isr, sr;
 
-	spin_lock(&channel->lock);
 	/* The HW is organized in pair of channels.  See which register we need
 	 * to read from */
 	isr = ioread8(&channel->block_regs->r.isr);
 	sr = ioread8(&channel->regs->r.sr);
+
+	if (isr & (IMR_DELTA_BREAK_A | IMR_DELTA_BREAK_B))
+		iowrite8(CR_CMD_RESET_BREAK_CHANGE, &channel->regs->w.cr);
 
 	if ((sr & SR_TX_EMPTY) && (channel->nb_bytes == 0)) {
 		iowrite8(CR_DISABLE_TX, &channel->regs->w.cr);
@@ -213,8 +250,6 @@ static void ipoctal_irq_channel(struct ipoctal_channel *channel)
 	/* TX of each character */
 	if ((isr & channel->isr_tx_rdy_mask) && (sr & SR_TX_READY))
 		ipoctal_irq_tx(channel);
-
-	spin_unlock(&channel->lock);
 }
 
 static irqreturn_t ipoctal_irq_handler(void *arg)
@@ -244,7 +279,6 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 	int res;
 	int i;
 	struct tty_driver *tty;
-	char name[20];
 	struct ipoctal_channel *channel;
 	struct ipack_region *region;
 	void __iomem *addr;
@@ -254,7 +288,7 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 	ipoctal->board_id = ipoctal->dev->id_device;
 
 	region = &ipoctal->dev->region[IPACK_IO_SPACE];
-	addr = devm_ioremap_nocache(&ipoctal->dev->dev,
+	addr = devm_ioremap(&ipoctal->dev->dev,
 				    region->start, region->size);
 	if (!addr) {
 		dev_err(&ipoctal->dev->dev,
@@ -270,7 +304,7 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 
 	region = &ipoctal->dev->region[IPACK_INT_SPACE];
 	ipoctal->int_space =
-		devm_ioremap_nocache(&ipoctal->dev->dev,
+		devm_ioremap(&ipoctal->dev->dev,
 				     region->start, region->size);
 	if (!ipoctal->int_space) {
 		dev_err(&ipoctal->dev->dev,
@@ -281,7 +315,7 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 
 	region = &ipoctal->dev->region[IPACK_MEM8_SPACE];
 	ipoctal->mem8_space =
-		devm_ioremap_nocache(&ipoctal->dev->dev,
+		devm_ioremap(&ipoctal->dev->dev,
 				     region->start, 0x8000);
 	if (!ipoctal->mem8_space) {
 		dev_err(&ipoctal->dev->dev,
@@ -305,10 +339,7 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 			channel->isr_rx_rdy_mask = ISR_RxRDY_FFULL_A;
 		}
 
-		iowrite8(CR_DISABLE_RX | CR_DISABLE_TX, &channel->regs->w.cr);
-		channel->rx_enable = 0;
-		iowrite8(CR_CMD_RESET_RX, &channel->regs->w.cr);
-		iowrite8(CR_CMD_RESET_TX, &channel->regs->w.cr);
+		ipoctal_reset_channel(channel);
 		iowrite8(MR1_CHRL_8_BITS | MR1_ERROR_CHAR | MR1_RxINT_RxRDY,
 			 &channel->regs->w.mr); /* mr1 */
 		iowrite8(0, &channel->regs->w.mr); /* mr2 */
@@ -324,13 +355,6 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 			 &block_regs[i].w.imr);
 	}
 
-	/*
-	 * IP-OCTAL has different addresses to copy its IRQ vector.
-	 * Depending of the carrier these addresses are accesible or not.
-	 * More info in the datasheet.
-	 */
-	ipoctal->dev->bus->ops->request_irq(ipoctal->dev,
-				       ipoctal_irq_handler, ipoctal);
 	/* Dummy write */
 	iowrite8(1, ipoctal->mem8_space + 1);
 
@@ -345,8 +369,11 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 	/* Fill struct tty_driver with ipoctal data */
 	tty->owner = THIS_MODULE;
 	tty->driver_name = KBUILD_MODNAME;
-	sprintf(name, KBUILD_MODNAME ".%d.%d.", bus_nr, slot);
-	tty->name = name;
+	tty->name = kasprintf(GFP_KERNEL, KBUILD_MODNAME ".%d.%d.", bus_nr, slot);
+	if (!tty->name) {
+		res = -ENOMEM;
+		goto err_put_driver;
+	}
 	tty->major = 0;
 
 	tty->minor_start = 0;
@@ -362,8 +389,7 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 	res = tty_register_driver(tty);
 	if (res) {
 		dev_err(&ipoctal->dev->dev, "Can't register tty driver.\n");
-		put_tty_driver(tty);
-		return res;
+		goto err_free_name;
 	}
 
 	/* Save struct tty_driver for use it when uninstalling the device */
@@ -374,7 +400,9 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 
 		channel = &ipoctal->channel[i];
 		tty_port_init(&channel->tty_port);
-		tty_port_alloc_xmit_buf(&channel->tty_port);
+		res = tty_port_alloc_xmit_buf(&channel->tty_port);
+		if (res)
+			continue;
 		channel->tty_port.ops = &ipoctal_tty_port_ops;
 
 		ipoctal_reset_stats(&channel->stats);
@@ -382,16 +410,33 @@ static int ipoctal_inst_slot(struct ipoctal *ipoctal, unsigned int bus_nr,
 		spin_lock_init(&channel->lock);
 		channel->pointer_read = 0;
 		channel->pointer_write = 0;
-		tty_dev = tty_port_register_device(&channel->tty_port, tty, i, NULL);
+		tty_dev = tty_port_register_device_attr(&channel->tty_port, tty,
+							i, NULL, channel, NULL);
 		if (IS_ERR(tty_dev)) {
 			dev_err(&ipoctal->dev->dev, "Failed to register tty device.\n");
+			tty_port_free_xmit_buf(&channel->tty_port);
 			tty_port_destroy(&channel->tty_port);
 			continue;
 		}
-		dev_set_drvdata(tty_dev, channel);
+		channel->tty_registered = true;
 	}
 
+	/*
+	 * IP-OCTAL has different addresses to copy its IRQ vector.
+	 * Depending of the carrier these addresses are accesible or not.
+	 * More info in the datasheet.
+	 */
+	ipoctal->dev->bus->ops->request_irq(ipoctal->dev,
+				       ipoctal_irq_handler, ipoctal);
+
 	return 0;
+
+err_free_name:
+	kfree(tty->name);
+err_put_driver:
+	put_tty_driver(tty);
+
+	return res;
 }
 
 static inline int ipoctal_copy_write_buffer(struct ipoctal_channel *channel,
@@ -467,11 +512,7 @@ static void ipoctal_set_termios(struct tty_struct *tty,
 	cflag = tty->termios.c_cflag;
 
 	/* Disable and reset everything before change the setup */
-	iowrite8(CR_DISABLE_RX | CR_DISABLE_TX, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_RX, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_TX, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_ERR_STATUS, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_MR, &channel->regs->w.cr);
+	ipoctal_reset_channel(channel);
 
 	/* Set Bits per chars */
 	switch (cflag & CSIZE) {
@@ -609,14 +650,8 @@ static void ipoctal_hangup(struct tty_struct *tty)
 
 	tty_port_hangup(&channel->tty_port);
 
-	iowrite8(CR_DISABLE_RX | CR_DISABLE_TX, &channel->regs->w.cr);
-	channel->rx_enable = 0;
-	iowrite8(CR_CMD_RESET_RX, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_TX, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_ERR_STATUS, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_MR, &channel->regs->w.cr);
-
-	clear_bit(ASYNCB_INITIALIZED, &channel->tty_port.flags);
+	ipoctal_reset_channel(channel);
+	tty_port_set_initialized(&channel->tty_port, 0);
 	wake_up_interruptible(&channel->tty_port.open_wait);
 }
 
@@ -627,17 +662,22 @@ static void ipoctal_shutdown(struct tty_struct *tty)
 	if (channel == NULL)
 		return;
 
-	iowrite8(CR_DISABLE_RX | CR_DISABLE_TX, &channel->regs->w.cr);
-	channel->rx_enable = 0;
-	iowrite8(CR_CMD_RESET_RX, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_TX, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_ERR_STATUS, &channel->regs->w.cr);
-	iowrite8(CR_CMD_RESET_MR, &channel->regs->w.cr);
-	clear_bit(ASYNCB_INITIALIZED, &channel->tty_port.flags);
+	ipoctal_reset_channel(channel);
+	tty_port_set_initialized(&channel->tty_port, 0);
+}
+
+static void ipoctal_cleanup(struct tty_struct *tty)
+{
+	struct ipoctal_channel *channel = tty->driver_data;
+	struct ipoctal *ipoctal = chan_to_ipoctal(channel, tty->index);
+
+	/* release the carrier driver */
+	ipack_put_carrier(ipoctal->dev);
 }
 
 static const struct tty_operations ipoctal_fops = {
 	.ioctl =		NULL,
+	.install =		ipoctal_install,
 	.open =			ipoctal_open,
 	.close =		ipoctal_close,
 	.write =		ipoctal_write_tty,
@@ -647,6 +687,7 @@ static const struct tty_operations ipoctal_fops = {
 	.get_icount =		ipoctal_get_icount,
 	.hangup =		ipoctal_hangup,
 	.shutdown =		ipoctal_shutdown,
+	.cleanup =              ipoctal_cleanup,
 };
 
 static int ipoctal_probe(struct ipack_device *dev)
@@ -679,12 +720,17 @@ static void __ipoctal_remove(struct ipoctal *ipoctal)
 
 	for (i = 0; i < NR_CHANNELS; i++) {
 		struct ipoctal_channel *channel = &ipoctal->channel[i];
+
+		if (!channel->tty_registered)
+			continue;
+
 		tty_unregister_device(ipoctal->tty_drv, i);
 		tty_port_free_xmit_buf(&channel->tty_port);
 		tty_port_destroy(&channel->tty_port);
 	}
 
 	tty_unregister_driver(ipoctal->tty_drv);
+	kfree(ipoctal->tty_drv->name);
 	put_tty_driver(ipoctal->tty_drv);
 	kfree(ipoctal);
 }

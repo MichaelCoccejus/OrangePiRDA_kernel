@@ -25,15 +25,18 @@
  * Jackie Li<yaodong.li@intel.com>
  */
 
-#include <linux/module.h>
-
-#include "mdfld_dsi_output.h"
-#include "mdfld_dsi_dpi.h"
-#include "mdfld_output.h"
-#include "mdfld_dsi_pkg_sender.h"
-#include "tc35876x-dsi-lvds.h"
+#include <linux/delay.h>
+#include <linux/moduleparam.h>
 #include <linux/pm_runtime.h>
+#include <linux/gpio/consumer.h>
+
 #include <asm/intel_scu_ipc.h>
+
+#include "mdfld_dsi_dpi.h"
+#include "mdfld_dsi_output.h"
+#include "mdfld_dsi_pkg_sender.h"
+#include "mdfld_output.h"
+#include "tc35876x-dsi-lvds.h"
 
 /* get the LABC from command line. */
 static int LABC_control = 1;
@@ -249,12 +252,11 @@ static int mdfld_dsi_connector_set_property(struct drm_connector *connector,
 	struct drm_encoder *encoder = connector->encoder;
 
 	if (!strcmp(property->name, "scaling mode") && encoder) {
-		struct psb_intel_crtc *psb_crtc =
-					to_psb_intel_crtc(encoder->crtc);
+		struct gma_crtc *gma_crtc = to_gma_crtc(encoder->crtc);
 		bool centerechange;
 		uint64_t val;
 
-		if (!psb_crtc)
+		if (!gma_crtc)
 			goto set_prop_error;
 
 		switch (value) {
@@ -281,21 +283,21 @@ static int mdfld_dsi_connector_set_property(struct drm_connector *connector,
 		centerechange = (val == DRM_MODE_SCALE_NO_SCALE) ||
 			(value == DRM_MODE_SCALE_NO_SCALE);
 
-		if (psb_crtc->saved_mode.hdisplay != 0 &&
-		    psb_crtc->saved_mode.vdisplay != 0) {
+		if (gma_crtc->saved_mode.hdisplay != 0 &&
+		    gma_crtc->saved_mode.vdisplay != 0) {
 			if (centerechange) {
 				if (!drm_crtc_helper_set_mode(encoder->crtc,
-						&psb_crtc->saved_mode,
+						&gma_crtc->saved_mode,
 						encoder->crtc->x,
 						encoder->crtc->y,
-						encoder->crtc->fb))
+						encoder->crtc->primary->fb))
 					goto set_prop_error;
 			} else {
-				struct drm_encoder_helper_funcs *funcs =
+				const struct drm_encoder_helper_funcs *funcs =
 						encoder->helper_private;
 				funcs->mode_set(encoder,
-					&psb_crtc->saved_mode,
-					&psb_crtc->saved_adjusted_mode);
+					&gma_crtc->saved_mode,
+					&gma_crtc->saved_adjusted_mode);
 			}
 		}
 	} else if (!strcmp(property->name, "backlight") && encoder) {
@@ -319,7 +321,7 @@ static void mdfld_dsi_connector_destroy(struct drm_connector *connector)
 
 	if (!dsi_connector)
 		return;
-	drm_sysfs_connector_remove(connector);
+	drm_connector_unregister(connector);
 	drm_connector_cleanup(connector);
 	sender = dsi_connector->pkg_sender;
 	mdfld_dsi_pkg_sender_destroy(sender);
@@ -336,11 +338,6 @@ static int mdfld_dsi_connector_get_modes(struct drm_connector *connector)
 	struct drm_display_mode *dup_mode = NULL;
 	struct drm_device *dev = connector->dev;
 
-	connector->display_info.min_vfreq = 0;
-	connector->display_info.max_vfreq = 200;
-	connector->display_info.min_hfreq = 0;
-	connector->display_info.max_hfreq = 200;
-
 	if (fixed_mode) {
 		dev_dbg(dev->dev, "fixed_mode %dx%d\n",
 				fixed_mode->hdisplay, fixed_mode->vdisplay);
@@ -352,7 +349,7 @@ static int mdfld_dsi_connector_get_modes(struct drm_connector *connector)
 	return 0;
 }
 
-static int mdfld_dsi_connector_mode_valid(struct drm_connector *connector,
+static enum drm_mode_status mdfld_dsi_connector_mode_valid(struct drm_connector *connector,
 						struct drm_display_mode *mode)
 {
 	struct mdfld_dsi_connector *dsi_connector =
@@ -370,7 +367,7 @@ static int mdfld_dsi_connector_mode_valid(struct drm_connector *connector,
 	/**
 	 * FIXME: current DC has no fitting unit, reject any mode setting
 	 * request
-	 * Will figure out a way to do up-scaling(pannel fitting) later.
+	 * Will figure out a way to do up-scaling(panel fitting) later.
 	 **/
 	if (fixed_mode) {
 		if (mode->hdisplay != fixed_mode->hdisplay)
@@ -381,16 +378,6 @@ static int mdfld_dsi_connector_mode_valid(struct drm_connector *connector,
 	}
 
 	return MODE_OK;
-}
-
-static void mdfld_dsi_connector_dpms(struct drm_connector *connector, int mode)
-{
-	if (mode == connector->dpms)
-		return;
-
-	/*first, execute dpms*/
-
-	drm_helper_connector_dpms(connector, mode);
 }
 
 static struct drm_encoder *mdfld_dsi_connector_best_encoder(
@@ -405,9 +392,7 @@ static struct drm_encoder *mdfld_dsi_connector_best_encoder(
 
 /*DSI connector funcs*/
 static const struct drm_connector_funcs mdfld_dsi_connector_funcs = {
-	.dpms = /*drm_helper_connector_dpms*/mdfld_dsi_connector_dpms,
-	.save = mdfld_dsi_connector_save,
-	.restore = mdfld_dsi_connector_restore,
+	.dpms = drm_helper_connector_dpms,
 	.detect = mdfld_dsi_connector_detect,
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.set_property = mdfld_dsi_connector_set_property,
@@ -448,42 +433,42 @@ static int mdfld_dsi_get_default_config(struct drm_device *dev,
 	return 0;
 }
 
-int mdfld_dsi_panel_reset(int pipe)
+int mdfld_dsi_panel_reset(struct drm_device *ddev, int pipe)
 {
-	unsigned gpio;
-	int ret = 0;
+	struct device *dev = ddev->dev;
+	struct gpio_desc *gpiod;
 
+	/*
+	 * Raise the GPIO reset line for the corresponding pipe to HIGH,
+	 * this is probably because it is active low so this takes the
+	 * respective pipe out of reset. (We have no code to put it back
+	 * into reset in this driver.)
+	 */
 	switch (pipe) {
 	case 0:
-		gpio = 128;
+		gpiod = gpiod_get(dev, "dsi-pipe0-reset", GPIOD_OUT_HIGH);
+		if (IS_ERR(gpiod))
+			return PTR_ERR(gpiod);
 		break;
 	case 2:
-		gpio = 34;
+		gpiod = gpiod_get(dev, "dsi-pipe2-reset", GPIOD_OUT_HIGH);
+		if (IS_ERR(gpiod))
+			return PTR_ERR(gpiod);
 		break;
 	default:
-		DRM_ERROR("Invalid output\n");
+		DRM_DEV_ERROR(dev, "Invalid output pipe\n");
 		return -EINVAL;
 	}
+	gpiod_put(gpiod);
 
-	ret = gpio_request(gpio, "gfx");
-	if (ret) {
-		DRM_ERROR("gpio_rqueset failed\n");
-		return ret;
-	}
+	/* Flush posted writes on the device */
+	gpiod = gpiod_get(dev, "dsi-pipe0-reset", GPIOD_ASIS);
+	if (IS_ERR(gpiod))
+		return PTR_ERR(gpiod);
+	gpiod_get_value(gpiod);
+	gpiod_put(gpiod);
 
-	ret = gpio_direction_output(gpio, 1);
-	if (ret) {
-		DRM_ERROR("gpio_direction_output failed\n");
-		goto gpio_error;
-	}
-
-	gpio_get_value(128);
-
-gpio_error:
-	if (gpio_is_valid(gpio))
-		gpio_free(gpio);
-
-	return ret;
+	return 0;
 }
 
 /*
@@ -514,7 +499,7 @@ void mdfld_dsi_output_init(struct drm_device *dev,
 		return;
 	}
 
-	/*create a new connetor*/
+	/*create a new connector*/
 	dsi_connector = kzalloc(sizeof(struct mdfld_dsi_connector), GFP_KERNEL);
 	if (!dsi_connector) {
 		DRM_ERROR("No memory");
@@ -547,7 +532,7 @@ void mdfld_dsi_output_init(struct drm_device *dev,
 	dsi_config->connector = dsi_connector;
 
 	if (!dsi_config->fixed_mode) {
-		DRM_ERROR("No pannel fixed mode was found\n");
+		DRM_ERROR("No panel fixed mode was found\n");
 		goto dsi_init_err0;
 	}
 
@@ -564,6 +549,9 @@ void mdfld_dsi_output_init(struct drm_device *dev,
 
 
 	connector = &dsi_connector->base.base;
+	dsi_connector->base.save = mdfld_dsi_connector_save;
+	dsi_connector->base.restore = mdfld_dsi_connector_restore;
+
 	drm_connector_init(dev, connector, &mdfld_dsi_connector_funcs,
 						DRM_MODE_CONNECTOR_LVDS);
 	drm_connector_helper_add(connector, &mdfld_dsi_connector_helper_funcs);
@@ -598,7 +586,7 @@ void mdfld_dsi_output_init(struct drm_device *dev,
 	dsi_config->encoder = encoder;
 	encoder->base.type = (pipe == 0) ? INTEL_OUTPUT_MIPI :
 		INTEL_OUTPUT_MIPI2;
-	drm_sysfs_connector_add(connector);
+	drm_connector_register(connector);
 	return;
 
 	/*TODO: add code to destroy outputs on error*/
